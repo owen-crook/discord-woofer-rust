@@ -6,6 +6,13 @@ use serde::{Deserialize, Serialize};
 use serenity::builder::GetMessages;
 use serenity::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
+use tokio::sync::RwLock;
+use std::sync::Arc;
+// Global rate limit tracker for 429s
+lazy_static! {
+    static ref NEXT_ALLOWED_REQUEST: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
+}
 
 const MODEL: &str = "llama-3.1-8b-instant";
 const OUTPUT_PREFIX: &str = "<:pupgpt:1121198908593426462>";
@@ -166,6 +173,19 @@ pub async fn gpt(
 ) -> anyhow::Result<(Option<String>, String)> {
     let client = reqwest::Client::new();
 
+    // Wait if we're currently rate limited
+    {
+        let guard = NEXT_ALLOWED_REQUEST.read().await;
+        if let Some(instant) = *guard {
+            let now = Instant::now();
+            if now < instant {
+                let wait = instant - now;
+                println!("Rate limited, waiting for {:?}", wait);
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+
     let messages = get_messages(ctx, msg).await;
     if msg.content == "puppy gpt debug" && msg.author.name == "purplepuppy" {
         println!("{messages:#?}");
@@ -184,29 +204,56 @@ pub async fn gpt(
         // reasoning_format: "parsed".to_string(),
     };
 
-    let response = client
-        .post("https://api.groq.com/openai/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()
-        .await?;
+    let max_retries = 3;
+    let mut attempts = 0;
+    loop {
+        let response = client
+            .post("https://api.groq.com/openai/v1/chat/completions")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .header("Content-Type", "application/json")
+            .json(&payload)
+            .send()
+            .await?;
 
-    if !response.status().is_success() {
-        dbg!(&response);
-        return Err(anyhow!("Request failed with status: {}", response.status()));
-    }
-    let response: ChatCompletionResponse = response.json().await?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Parse retry-after header
+            let retry_after = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(5); // Default to 5 seconds if missing
 
-    if let Some(choice) = response.choices.first() {
-        let mut output = choice.message.content.clone();
-        if output.starts_with("woofer: ") || output.starts_with("Woofer: ") {
-            output = choice.message.content[8..].to_string();
+            let until = Instant::now() + Duration::from_secs(retry_after);
+            {
+                let mut guard = NEXT_ALLOWED_REQUEST.write().await;
+                *guard = Some(until);
+            }
+            println!("429 received, pausing for {} seconds (attempt {}/{})", retry_after, attempts + 1, max_retries);
+            tokio::time::sleep(Duration::from_secs(retry_after)).await;
+            attempts += 1;
+            if attempts >= max_retries {
+                return Err(anyhow!("Rate limited after {} retries, try again in {} seconds", max_retries, retry_after));
+            }
+            continue;
         }
 
-        let message = replace_discord_emojis(&output);
-        Ok((choice.message.reasoning.clone(), message.to_string()))
-    } else {
-        Err(anyhow::anyhow!("No choices found in the response"))
+        if !response.status().is_success() {
+            dbg!(&response);
+            return Err(anyhow!("Request failed with status: {}", response.status()));
+        }
+        let response: ChatCompletionResponse = response.json().await?;
+
+        if let Some(choice) = response.choices.first() {
+            let mut output = choice.message.content.clone();
+            if output.starts_with("woofer: ") || output.starts_with("Woofer: ") {
+                output = choice.message.content[8..].to_string();
+            }
+
+            let message = replace_discord_emojis(&output);
+            return Ok((choice.message.reasoning.clone(), message.to_string()));
+        } else {
+            return Err(anyhow::anyhow!("No choices found in the response"));
+        }
     }
 }
